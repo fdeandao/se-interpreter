@@ -22,6 +22,7 @@ var glob = require('glob');
 var util = require('util');
 var pathLib = require('path');
 var fs = require('fs');
+var http = require('http');
 
 // Common functionality for assert/verify/waitFor/store step types. Only the code for actually
 // getting the value has to be implemented individually.
@@ -269,8 +270,10 @@ TestRun.prototype.p = function(name) {
     throw new Error('Missing parameter "' + name + '" in step #' + (this.stepIndex + 1) + '.'); 
   }
   var v = s[name];
-  for (var k in this.vars) {
-    v = v.replace(new RegExp("\\$\\{" + k + "\\}", "g"), this.vars[k]);
+  if(v === "string"){
+    for (var k in this.vars) {
+      v = v.replace(new RegExp("\\$\\{" + k + "\\}", "g"), this.vars[k]);
+    }
   }
   return v;
 };
@@ -385,7 +388,7 @@ function getInterpreterListener(testRun) {
 function parseJSONFile(path, testRuns, silencePrints, listenerFactory, exeFactory, browserOptions, driverOptions, listenerOptions) {
   var rawData = fs.readFileSync(path, "UTF-8");
   var data = JSON.parse(rawData);
-  if (data.type == 'script') {
+  if (!data.type || data.type == 'script') {
     var tr = createTestRun(path, silencePrints, listenerFactory, exeFactory, browserOptions, driverOptions, listenerOptions);
     if (tr) { testRuns.push(tr); }
   }
@@ -395,6 +398,20 @@ function parseJSONFile(path, testRuns, silencePrints, listenerFactory, exeFactor
   }
   if (data.type == 'suite') {
     parseSuiteFile(path, data, testRuns, silencePrints, listenerFactory, exeFactory, browserOptions, driverOptions, listenerOptions);
+  }
+}
+
+function parseJSON(data, testRuns, silencePrints, listenerFactory, exeFactory, browserOptions, driverOptions, listenerOptions) {
+  if (!data.type || data.type == 'script') {
+    var tr = createTestRunJson(data, silencePrints, listenerFactory, exeFactory, browserOptions, driverOptions, listenerOptions);
+    if (tr) { testRuns.push(tr); }
+  }
+  if (data.type == 'interpreter-config') {
+    data = JSON.parse(subEnvVars(data));
+    parseConfigJson(data, testRuns, silencePrints, listenerFactory, exeFactory, listenerOptions);
+  }
+  if (data.type == 'suite') {
+    parseSuiteJson(data, testRuns, silencePrints, listenerFactory, exeFactory, browserOptions, driverOptions, listenerOptions);
   }
 }
 
@@ -415,6 +432,24 @@ function parseConfigFile(fileContents, testRuns, silencePrints, listenerFactory,
             parseJSONFile(path, testRuns, silencePrints, listenerFactory, exeFactory, settings.browserOptions, settings.driverOptions, listenerOptions);
           }
         });
+      });
+    });
+  });
+};
+
+/** Parses a config JSON file and adds the resulting TestRuns to testRuns. */
+function parseConfigJson(data, testRuns, silencePrints, listenerFactory, exeFactory, listenerOptions) {
+  data.configurations.forEach(function(config) {
+    var settingsList = config.settings;
+    if (!settingsList || settingsList.length == 0) {
+      settingsList = [{
+        'browserOptions': browserOptions,
+        'driverOptions': driverOptions
+      }];
+    }
+    settingsList.forEach(function(settings) {
+      config.scripts.forEach(function(script) {        
+        parseJSON(script, testRuns, silencePrints, listenerFactory, exeFactory, settings.browserOptions, settings.driverOptions, listenerOptions);
       });
     });
   });
@@ -441,6 +476,15 @@ function parseSuiteFile(path, fileContents, testRuns, silencePrints, listenerFac
   });
 }
 
+/** Parses a suite JSON file and adds the resulting TestRuns to testRuns. */
+function parseSuiteJson(data, testRuns, silencePrints, listenerFactory, exeFactory, browserOptions, driverOptions, listenerOptions) {
+  data.scripts.forEach(function(script) {
+    var tr = null;
+    tr = createTestRunJson(script, silencePrints, listenerFactory, exeFactory, browserOptions, driverOptions, listenerOptions);
+    if (tr) { testRuns.push(tr); }
+  });
+}
+
 /** Loads a script JSON file and turns it into a test run. */
 function createTestRun(path, silencePrints, listenerFactory, exeFactory, browserOptions, driverOptions, listenerOptions) {
   var script = null;
@@ -452,6 +496,20 @@ function createTestRun(path, silencePrints, listenerFactory, exeFactory, browser
   }
   var name = path.replace(/.*\/|\\/, "").replace(/\.json$/, '');
   tr = new TestRun(script, name);
+  tr.browserOptions = browserOptions || tr.browserOptions;
+  tr.driverOptions = driverOptions || tr.driverOptions;
+  tr.silencePrints = silencePrints;
+  tr.listener = listenerFactory(tr, listenerOptions);
+  if (exeFactory) {
+    tr.executorFactories.splice(0, 0, exeFactory);
+  }
+  return tr;
+}
+
+/** Loads a script JSON file and turns it into a test run. */
+function createTestRunJson(data, silencePrints, listenerFactory, exeFactory, browserOptions, driverOptions, listenerOptions) {
+  var name = data._id;
+  tr = new TestRun(data.script, name);
   tr.browserOptions = browserOptions || tr.browserOptions;
   tr.driverOptions = driverOptions || tr.driverOptions;
   tr.silencePrints = silencePrints;
@@ -489,21 +547,32 @@ var opt = require('optimist')
   .default('parallel', 1).describe('parallel', 'number of tests to run in parallel')
   .describe('listener', 'path to listener module')
   .describe('executorFactory', 'path to factory for extra type executors')
-  .demand(1) // At least 1 script to execute.
+  .demand(0) // At least 1 script to execute.
   .usage('Usage: $0 [--option value...] [script-path...]\n\nPrefix brower options like browserName with "browser-", e.g. "--browser-browserName=firefox".\nPrefix driver options like host with "driver-", eg --driver-host=webdriver.foo.com.\nPrefix listener module options with "listener-".');
 
 // Process arguments.
 var argv = opt.argv;
+var CONFIG = argv.config && JSON.parse(fs.readFileSync(argv.config, "UTF-8"));
 
 var numParallelRunners = parseInt(argv.parallel);
 
 var browserOptions = { 'browserName': 'firefox' };
+if(CONFIG.browser){
+    for(var v in CONFIG.browser){
+        browserOptions[v] = CONFIG.browser[v];
+    }
+}
 for (var k in argv) {
   if (S(k).startsWith('browser-')) {
     browserOptions[k.substring('browser-'.length)] = argv[k];
   }
 }
 var driverOptions = {};
+if(CONFIG.driver){
+    for(var v in CONFIG.driver){
+        driverOptions[v] = CONFIG.driver[v];
+    }
+}
 for (var k in argv) {
   if (S(k).startsWith('driver-')) {
     driverOptions[k.substring('driver-'.length)] = argv[k];
@@ -511,6 +580,11 @@ for (var k in argv) {
 }
 
 var listenerOptions = {};
+if(CONFIG.listener){
+    for(var v in CONFIG.listener){
+        listenerOptions[v] = CONFIG.listener[v];
+    }
+}
 for (var k in argv) {
   if (S(k).startsWith('listener-')) {
     listenerOptions[k.substring('listener-'.length)] = argv[k];
@@ -518,12 +592,24 @@ for (var k in argv) {
 }
 
 var listener = null;
+argv.listener = argv.listener || CONFIG.listenerfile;
 if (argv.listener) {
   try {
     listener = require(argv.listener);
   } catch (e) {
     console.error('Unable to load listener module ' + argv.listener + ': ' + e);
     process.exit(78);
+  }
+}
+var remoteOptions = {};
+if(CONFIG.remote){
+    for(var v in CONFIG.remote){
+        remoteOptions[v] = CONFIG.remote[v];
+    }
+}
+for (var k in argv) {
+  if (S(k).startsWith('remote-')) {
+    remoteOptions[k.substring('remote-'.length)] = argv[k];
   }
 }
 
@@ -537,6 +623,7 @@ if (listener) {
 }
 
 var exeFactory = null;
+argv.executorFactory = argv.executorFactory || CONFIG.executorFactory;
 if (argv.executorFactory) {
   try {
     exeFactory = require(argv.executorFactory);
@@ -547,12 +634,11 @@ if (argv.executorFactory) {
 }
 
 var testRuns = [];
-
+var silencePrints = argv.noPrint || argv.silent;
 argv._.forEach(function(pathToGlob) {
   glob.sync(pathToGlob).forEach(function(path) {
     if (S(path).endsWith('.json')) {
       var name = path.replace(/.*\/|\\/, "").replace(/\.json$/, "");
-      var silencePrints = argv.noPrint || argv.silent;
       try {
         parseJSONFile(path, testRuns, silencePrints, listenerFactory, exeFactory, browserOptions, driverOptions, listenerOptions);
       } catch (e) {
@@ -563,27 +649,48 @@ argv._.forEach(function(pathToGlob) {
   });
 });
 
-var index = -1;
-var successes = 0;
-var lastRunFinishedIndex = testRuns.length + numParallelRunners - 1;
-function runNext() {
-  index++;
-  if (index < testRuns.length) {
-    testRuns[index].run(function(info) {
-      if (info.success) { successes++; }
-      runNext();
-    });
-  } else {
-    if (index == lastRunFinishedIndex) { // We're the last runner to complete.
-      if (!argv.silent) {
-        console.log("\x1b[" + (successes == testRuns.length ? "32" : "31") + "m\x1b[1m" + successes + '/' + testRuns.length + ' tests ran successfully. Exiting.\x1b[30m\x1b[0m');
-      }
-      process.on('exit', function() { process.exit(successes == testRuns.length ? 0 : 1); });
-    }
-  }
+if(testRuns.length == 0){
+  var jsonRemote;
+  http.get(remoteOptions, function(res){
+      res.setEncoding('utf8');
+      var data = ""; 
+      res.on('data', function (chunk) {
+        data+=chunk;
+      }).on('end', function () {
+        jsonRemote = JSON.parse(data);
+        parseJSON(jsonRemote, testRuns, silencePrints, listenerFactory, exeFactory, browserOptions, driverOptions, listenerOptions);
+          run();
+      });
+  }).on('error', function(e) {
+    console.log('problem with request: ' + e.message);
+  }).end();
+}else{
+  run();
 }
 
-// Spawn as many parallel runners as desired.
-for (var i = 0; i < numParallelRunners; i++) {
-  runNext();
+function run(){
+    var index = -1;
+    var successes = 0;
+    var lastRunFinishedIndex = testRuns.length + numParallelRunners - 1;
+    function runNext() {
+      index++;
+      if (index < testRuns.length) {
+        testRuns[index].run(function(info) {
+          if (info.success) { successes++; }
+          runNext();
+        });
+      } else {
+        if (index == lastRunFinishedIndex) { // We're the last runner to complete.
+          if (!argv.silent) {
+            console.log("\x1b[" + (successes == testRuns.length ? "32" : "31") + "m\x1b[1m" + successes + '/' + testRuns.length + ' tests ran successfully. Exiting.\x1b[30m\x1b[0m');
+          }
+          process.on('exit', function() { process.exit(successes == testRuns.length ? 0 : 1); });
+        }
+      }
+    }
+
+    // Spawn as many parallel runners as desired.
+    for (var i = 0; i < numParallelRunners; i++) {
+      runNext();
+    }
 }
