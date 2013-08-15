@@ -592,7 +592,7 @@ for (var k in argv) {
 }
 
 var listener = null;
-argv.listener = argv.listener || CONFIG.listenerfile;
+argv.listener = argv.listener || CONFIG.listenerFile;
 if (argv.listener) {
   try {
     listener = require(argv.listener);
